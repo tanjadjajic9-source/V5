@@ -1,0 +1,336 @@
+name: Build Xbox OT-FM MSIX Package
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-xbox-msix:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Arrange Files Into The Right Folders And Apply Fixes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = (Get-Location).Path
+          New-Item -ItemType Directory -Force -Path "xbox-uwp\src\Shaders" | Out-Null
+          $map = @{
+            "App.vcxproj" = "xbox-uwp"; "Package.appxmanifest" = "xbox-uwp"; "XboxOTFM.sln" = "xbox-uwp"; "packages.config" = "xbox-uwp";
+            "Json.h" = "xbox-uwp\src"; "WebUiAssets.h" = "xbox-uwp\src";
+            "OptimalTransport.h" = "xbox-uwp\src"; "OptimalTransport.cpp" = "xbox-uwp\src";
+            "FMBrain.h" = "xbox-uwp\src"; "FMBrain.cpp" = "xbox-uwp\src";
+            "Trainer.h" = "xbox-uwp\src"; "Trainer.cpp" = "xbox-uwp\src";
+            "ImageUtil.h" = "xbox-uwp\src"; "ImageUtil.cpp" = "xbox-uwp\src";
+            "Dataset.h" = "xbox-uwp\src"; "Dataset.cpp" = "xbox-uwp\src";
+            "Checkpoint.h" = "xbox-uwp\src"; "Checkpoint.cpp" = "xbox-uwp\src";
+            "AppCore.h" = "xbox-uwp\src"; "AppCore.cpp" = "xbox-uwp\src";
+            "HttpServer.h" = "xbox-uwp\src"; "HttpServer.cpp" = "xbox-uwp\src";
+            "WebApi.h" = "xbox-uwp\src"; "WebApi.cpp" = "xbox-uwp\src";
+            "WebHost.h" = "xbox-uwp\src"; "WebHost.cpp" = "xbox-uwp\src";
+            "QrCode.h" = "xbox-uwp\src"; "QrCode.cpp" = "xbox-uwp\src";
+            "TvUi.h" = "xbox-uwp\src"; "TvUi.cpp" = "xbox-uwp\src";
+            "GamepadUI.h" = "xbox-uwp\src"; "GamepadUI.cpp" = "xbox-uwp\src";
+            "WebBridge.h" = "xbox-uwp\src"; "WebBridge.cpp" = "xbox-uwp\src";
+            "Main.cpp" = "xbox-uwp\src"; "FMCompute.hlsl" = "xbox-uwp\src\Shaders"
+          }
+          $missing = @()
+          foreach ($name in $map.Keys) {
+            $dest = Join-Path $root (Join-Path $map[$name] $name)
+            if (Test-Path $dest) { continue }
+            $found = Get-ChildItem -Path $root -Recurse -File -Filter $name | Where-Object { $_.FullName -notmatch '\\.git\\' } | Select-Object -First 1
+            if (-not $found) { $missing += $name; continue }
+            Copy-Item $found.FullName $dest
+            Write-Host "Placed $name (from $($found.FullName))"
+          }
+          if ($missing.Count -gt 0) { throw ("These files are missing from the repository. Upload them next to the other files: " + (($missing | Sort-Object) -join ", ")) }
+          # An old App.vcxproj would leave new program files out of the build and end in confusing "unresolved external" errors; say so plainly instead
+          $projText = Get-Content "xbox-uwp\App.vcxproj" -Raw
+          $notListed = @()
+          foreach ($cpp in Get-ChildItem "xbox-uwp\src" -Filter *.cpp) {
+            if ($projText -notmatch [regex]::Escape("src\" + $cpp.Name)) { $notListed += $cpp.Name }
+          }
+          if ($notListed.Count -gt 0) { throw ("The App.vcxproj in the repository is an old version: it does not list " + ($notListed -join ", ") + ". Upload the new App.vcxproj from the package.") }
+          function Fix($path, $pattern, $replacement) {
+            $t = Get-Content $path -Raw
+            $n = $t -replace $pattern, $replacement
+            if ($n -ne $t) { Set-Content $path $n -NoNewline; Write-Host "Fixed $path" }
+          }
+          $p = "xbox-uwp\App.vcxproj"
+          Fix $p '<WindowsTargetPlatformVersion>[^<]*<' '<WindowsTargetPlatformVersion>10.0.26100.0<'
+          if ((Get-Content $p -Raw) -notmatch 'NOMINMAX') { Fix $p 'WINAPI_FAMILY=WINAPI_FAMILY_APP;%' 'WINAPI_FAMILY=WINAPI_FAMILY_APP;NOMINMAX;%' }
+          if ((Get-Content $p -Raw) -notmatch 'PrecompiledHeader') { Fix $p '(<LanguageStandard>stdcpp20</LanguageStandard>)' "`$1`n      <PrecompiledHeader>NotUsing</PrecompiledHeader>" }
+          if ((Get-Content $p -Raw) -notmatch 'GenerateWindowsMetadata') { Fix $p '(<SubSystem>Windows</SubSystem>)' "`$1`n      <GenerateWindowsMetadata>false</GenerateWindowsMetadata>" }
+          # Every build gets its own, higher version number, so the Xbox installs it as an update of the app that is already on it
+          try {
+            $runNo = if ($env:GITHUB_RUN_NUMBER) { $env:GITHUB_RUN_NUMBER } else { "1" }
+            $attemptNo = if ($env:GITHUB_RUN_ATTEMPT) { $env:GITHUB_RUN_ATTEMPT } else { "1" }
+            Fix "xbox-uwp\Package.appxmanifest" '(<Identity[^>]*?Version=")[0-9.]+(")' ('${1}1.0.' + $runNo + '.' + $attemptNo + '${2}')
+          } catch { Write-Host "Could not set the build version (continuing): $_" }
+
+      - name: Setup NuGet
+        uses: nuget/setup-nuget@v2
+
+      - name: Setup MSBuild (Visual Studio 2022)
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Generate Placeholder Store/Tile PNG Assets
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          $assetsDir = "xbox-uwp\Assets"
+          New-Item -ItemType Directory -Force -Path $assetsDir | Out-Null
+          $specs = @{
+            "StoreLogo.png" = @(50, 50)
+            "Square44x44Logo.png" = @(44, 44)
+            "Square150x150Logo.png" = @(150, 150)
+            "Wide310x150Logo.png" = @(310, 150)
+            "SplashScreen.png" = @(620, 300)
+          }
+          foreach ($name in $specs.Keys) {
+            $w, $h = $specs[$name]
+            $bmp = New-Object System.Drawing.Bitmap($w, $h)
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.Clear([System.Drawing.Color]::FromArgb(11, 22, 38))
+            try {
+              # four little squares, one of them lit (the same mark as the phone page)
+              $dim = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(46, 71, 102))
+              $lit = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 122, 77))
+              $side = [int]([Math]::Min($w, $h) * 0.5)
+              $gap = [Math]::Max(1, [int]($side * 0.1))
+              $tile = [int](($side - $gap) / 2)
+              $x0 = [int](($w - (2 * $tile + $gap)) / 2)
+              $y0 = [int](($h - (2 * $tile + $gap)) / 2)
+              for ($i = 0; $i -lt 4; $i++) {
+                $cx = $x0 + ($i % 2) * ($tile + $gap)
+                $cy = $y0 + [int][Math]::Floor($i / 2) * ($tile + $gap)
+                if ($i -eq 3) { $g.FillRectangle($lit, $cx, $cy, $tile, $tile) } else { $g.FillRectangle($dim, $cx, $cy, $tile, $tile) }
+              }
+            } catch {
+              $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 122, 77))
+              $g.FillRectangle($brush, [int]($w * 0.25), [int]($h * 0.25), [int]($w * 0.5), [int]($h * 0.5))
+            }
+            $bmp.Save((Join-Path $assetsDir $name), [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose()
+            $bmp.Dispose()
+          }
+
+      - name: Precompile FMCompute.hlsl GPU Training Shaders
+        shell: pwsh
+        run: |
+          $sdkBin = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\10.0.*" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $fxc = Join-Path $sdkBin.FullName "x64\fxc.exe"
+          New-Item -ItemType Directory -Force -Path "xbox-uwp\Shaders" | Out-Null
+          $entries = @("CSEncodeSineOperators", "CSConvForward", "CSMSELossGrad", "CSConvBackwardInput", "CSSiLUBackward", "CSConvBackwardWeights", "CSSumSquaresPartial", "CSReduceFinalize", "CSAdamUpdate", "CSEulerStep")
+          # fxc's normal setting first (the one the original project used); if fxc itself crashes on a program, other settings are tried
+          $levels = @("/O1", "/Od", "/O2", "/O3")
+          $failed = @()
+          foreach ($entry in $entries) {
+            $out = "xbox-uwp\Shaders\$entry.cso"
+            $done = $false
+            foreach ($level in $levels) {
+              if (Test-Path $out) { Remove-Item $out -Force }
+              & $fxc /nologo $level /T cs_5_1 /E $entry /Fo $out "xbox-uwp\src\Shaders\FMCompute.hlsl"
+              if (($LASTEXITCODE -eq 0) -and (Test-Path $out)) {
+                Write-Host "Compiled $entry.cso (fxc setting $level)"
+                $done = $true
+                break
+              }
+              Write-Host "fxc setting $level did not work for $entry"
+            }
+            if (-not $done) { $failed += $entry }
+          }
+          # Emergency plan: if fxc cannot build one of the two programs that use shared memory, build its slower, simpler twin under the same file name
+          $twins = @{ "CSConvBackwardWeights" = "CSConvBackwardWeightsLite"; "CSReduceFinalize" = "CSReduceFinalizeLite" }
+          foreach ($entry in @($failed)) {
+            if (-not $twins.ContainsKey($entry)) { continue }
+            $out = "xbox-uwp\Shaders\$entry.cso"
+            foreach ($level in $levels) {
+              if (Test-Path $out) { Remove-Item $out -Force }
+              & $fxc /nologo $level /T cs_5_1 /E $twins[$entry] /Fo $out "xbox-uwp\src\Shaders\FMCompute.hlsl"
+              if (($LASTEXITCODE -eq 0) -and (Test-Path $out)) {
+                Write-Host "WARNING: $entry was built from its slower simple twin $($twins[$entry]) (fxc setting $level)"
+                $failed = @($failed | Where-Object { $_ -ne $entry })
+                break
+              }
+            }
+          }
+          # One extra program is only syntax-checked here (it is not shipped inside the app); a problem with it is only a warning
+          $checkOut = Join-Path $env:RUNNER_TEMP "CSPairwiseCost.check.cso"
+          & $fxc /nologo /O1 /T cs_5_1 /E CSPairwiseCost /Fo $checkOut "xbox-uwp\src\Shaders\FMCompute.hlsl"
+          if ($LASTEXITCODE -eq 0) { Write-Host "Syntax-checked CSPairwiseCost" } else { Write-Host "Note: the unused program CSPairwiseCost did not compile (the app does not need it)" }
+          $global:LASTEXITCODE = 0
+          if ($failed.Count -gt 0) { throw ("These graphics programs failed to compile: " + ($failed -join ", ")) }
+
+      - name: Bake a backup copy of the GPU programs into the app
+        shell: pwsh
+        run: |
+          # The app reads its GPU programs from the Shaders folder of its package first. This header is the safety net it falls back to,
+          # so the GPU keeps working even if the package builder leaves the Shaders folder out. A problem here only costs the safety net.
+          $root = (Get-Location).Path
+          $header = Join-Path $root "xbox-uwp\src\FMShaderBlobs.h"
+          if (Test-Path $header) { Remove-Item $header -Force }
+          try {
+            $entries = @("CSEncodeSineOperators", "CSConvForward", "CSMSELossGrad", "CSConvBackwardInput", "CSSiLUBackward", "CSConvBackwardWeights", "CSSumSquaresPartial", "CSReduceFinalize", "CSAdamUpdate", "CSEulerStep")
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.AppendLine("// Written by the build (build-xbox.yml): the compiled GPU programs, baked into the app as a safety net.")
+            [void]$sb.AppendLine("#pragma once")
+            [void]$sb.AppendLine("#include <cstddef>")
+            [void]$sb.AppendLine("namespace XboxOTFM {")
+            [void]$sb.AppendLine("namespace EmbeddedShaders {")
+            [void]$sb.AppendLine("struct Blob { const char* name; const unsigned char* data; std::size_t size; };")
+            foreach ($entry in $entries) {
+              $file = Join-Path $root "xbox-uwp\Shaders\$entry.cso"
+              $bytes = [System.IO.File]::ReadAllBytes($file)
+              if ($bytes.Length -lt 4) { throw "$file is empty" }
+              [void]$sb.AppendLine("inline constexpr unsigned char k_$entry[] = {")
+              for ($i = 0; $i -lt $bytes.Length; $i += 32) {
+                $last = [Math]::Min($i + 31, $bytes.Length - 1)
+                [void]$sb.AppendLine(($bytes[$i..$last] -join ",") + ",")
+              }
+              [void]$sb.AppendLine("};")
+            }
+            [void]$sb.AppendLine("inline constexpr Blob kBlobs[] = {")
+            foreach ($entry in $entries) {
+              [void]$sb.AppendLine("    { `"$entry`", k_$entry, sizeof(k_$entry) },")
+            }
+            [void]$sb.AppendLine("};")
+            [void]$sb.AppendLine("}")
+            [void]$sb.AppendLine("}")
+            [System.IO.File]::WriteAllText($header, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "Backup copy of $($entries.Count) GPU programs written ($((Get-Item $header).Length) bytes)"
+          } catch {
+            Write-Host "WARNING: could not build the backup copy of the GPU programs (the app will rely on its Shaders folder): $_"
+            if (Test-Path $header) { Remove-Item $header -Force }
+          }
+          $global:LASTEXITCODE = 0
+
+      - name: Create Self-Signed Test Certificate for Xbox Dev Mode
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate `
+            -Type Custom `
+            -Subject "CN=XboxOTFMDev" `
+            -KeyUsage DigitalSignature `
+            -FriendlyName "Xbox OT-FM Dev Signing Cert" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+          $pwd = ConvertTo-SecureString -String "XboxOTFM2026!" -Force -AsPlainText
+          New-Item -ItemType Directory -Force -Path "dist-xbox" | Out-Null
+          Export-PfxCertificate -Cert $cert -FilePath "xbox-uwp\XboxOTFM_Cert.pfx" -Password $pwd | Out-Null
+          Export-Certificate -Cert $cert -FilePath "dist-xbox\XboxOTFM_Cert.cer" | Out-Null
+
+      - name: Restore DirectML & CppWinRT NuGet Packages
+        run: nuget restore xbox-uwp\XboxOTFM.sln -PackagesDirectory xbox-uwp\packages
+
+      - name: Pack DirectML helper inside the app
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path "xbox-uwp\packages" -Recurse -Filter DirectML.dll | Where-Object { $_.FullName -match "x64" } | Select-Object -First 1
+          if (-not $dll) { throw "DirectML.dll x64 not found" }
+          Copy-Item $dll.FullName -Destination "xbox-uwp\DirectML.dll" -Force
+          $p = "xbox-uwp\App.vcxproj"
+          $x = Get-Content $p -Raw
+          if ($x -notmatch 'Include="DirectML.dll"') {
+            $x = $x -replace '(<Image Include="Assets\\StoreLogo.png">)', '<None Include="DirectML.dll"><DeploymentContent>true</DeploymentContent></None>$1'
+            Set-Content $p $x
+          }
+          if ((Get-Content $p -Raw) -notmatch 'Include="DirectML.dll"') { throw "Could not add DirectML.dll to project" }
+
+      - name: Pack GPU graphics programs inside the app
+        shell: pwsh
+        run: |
+          $p = "xbox-uwp\App.vcxproj"
+          $x = Get-Content $p -Raw
+          # The app package only takes up files that are listed as <None> items (the way DirectML.dll is listed). A listing under another
+          # item type (for example <Content>) is silently left out of the package, so every earlier listing of a .cso is replaced.
+          $x = [regex]::Replace($x, '<(?:Content|None) Include="Shaders\\[^"]+\.cso"\s*(?:/>|>.*?</(?:Content|None)>)\s*', '', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+          $items = ""
+          foreach ($cso in Get-ChildItem "xbox-uwp\Shaders" -Filter *.cso) {
+            $items += "<None Include=`"Shaders\$($cso.Name)`"><DeploymentContent>true</DeploymentContent></None>`n"
+          }
+          $anchor = '<Image Include="Assets\StoreLogo.png">'
+          if ($x.Contains($anchor)) {
+            $x = $x.Replace($anchor, $items + $anchor)
+          } else {
+            $end = $x.LastIndexOf("</Project>")
+            if ($end -lt 0) { throw "App.vcxproj looks damaged" }
+            $x = $x.Insert($end, "<ItemGroup>`n" + $items + "</ItemGroup>`n")
+          }
+          Set-Content $p $x
+          $text = Get-Content $p -Raw
+          $count = ([regex]::Matches($text, '<None Include="Shaders\\[^"]+\.cso"')).Count
+          $stale = ([regex]::Matches($text, '<Content Include="Shaders\\[^"]+\.cso"')).Count
+          if ($stale -gt 0) { throw "$stale graphics programs are still listed the old way" }
+          if ($count -lt 10) { throw "Only $count of 10 graphics programs were added to the app" }
+          Write-Host "Added $count graphics programs to the app"
+
+      - name: Build & Package Signed MSIX (Release|x64)
+        shell: pwsh
+        run: |
+          msbuild xbox-uwp\XboxOTFM.sln `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:AppxBundle=Never `
+            /p:UapAppxPackageBuildMode=StoreUpload `
+            /p:AppxPackageExtension=.msix `
+            /p:PackageCertificateKeyFile=XboxOTFM_Cert.pfx `
+            /p:PackageCertificatePassword=XboxOTFM2026! `
+            /p:OutDir=..\build-out\ `
+            "/clp:ErrorsOnly;Summary" `
+            /m
+
+      - name: Locate & Sign MSIX + Collect Dependencies
+        shell: pwsh
+        run: |
+          $sdkBin = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\10.0.*" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $signtool = Join-Path $sdkBin.FullName "x64\signtool.exe"
+          $msixFiles = Get-ChildItem -Path "xbox-uwp","build-out" -Recurse -Include *.msix,*.appx
+          foreach ($pkg in $msixFiles) {
+            Copy-Item $pkg.FullName -Destination "dist-xbox\" -Force
+            & $signtool sign /fd SHA256 /f "xbox-uwp\XboxOTFM_Cert.pfx" /p "XboxOTFM2026!" (Join-Path "dist-xbox" $pkg.Name)
+          }
+          $deps = Get-ChildItem -Path "xbox-uwp\packages" -Recurse -Include DirectML.dll
+          foreach ($d in $deps) {
+            Copy-Item $d.FullName -Destination "dist-xbox\" -Force
+          }
+
+      - name: Check the app really contains its helpers
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $pkg = Get-ChildItem "dist-xbox" -Filter *.msix | Select-Object -First 1
+          if (-not $pkg) { throw "No .msix app was produced" }
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($pkg.FullName)
+          $names = @($zip.Entries | ForEach-Object { $_.FullName })
+          $zip.Dispose()
+          # Same spelling for every entry: forward slashes, no leading slash, %20-style escapes decoded
+          $clean = @($names | ForEach-Object { [System.Uri]::UnescapeDataString($_).Replace("\", "/").TrimStart("/") })
+          Write-Host "$($pkg.Name) holds $($clean.Count) files:"
+          foreach ($n in ($clean | Sort-Object)) { Write-Host "   $n" }
+          if (-not ($clean -contains "DirectML.dll")) { throw "DirectML.dll is not inside the app" }
+          Write-Host "OK: DirectML.dll is inside $($pkg.Name)"
+          $gpuPrograms = @("CSEncodeSineOperators", "CSConvForward", "CSMSELossGrad", "CSConvBackwardInput", "CSSiLUBackward", "CSConvBackwardWeights", "CSSumSquaresPartial", "CSReduceFinalize", "CSAdamUpdate", "CSEulerStep")
+          $missing = @($gpuPrograms | Where-Object { -not ($clean -contains "Shaders/$_.cso") })
+          if ($missing.Count -eq 0) {
+            Write-Host "OK: all $($gpuPrograms.Count) GPU programs are inside $($pkg.Name)"
+          } elseif ((Test-Path "xbox-uwp\src\FMShaderBlobs.h") -and (Select-String -Path "xbox-uwp\src\FMBrain.cpp" -Pattern "FMShaderBlobs.h" -SimpleMatch -Quiet)) {
+            Write-Host "WARNING: these GPU programs are not in the package's Shaders folder: $($missing -join ', ')"
+            Write-Host "OK anyway: the app carries its own built-in copy of the GPU programs, so GPU training still works."
+          } else {
+            throw "GPU programs missing from the app: $($missing -join ', ')"
+          }
+
+      - name: Upload Xbox MSIX Bundle Artifact
+        if: ${{ !cancelled() && hashFiles('dist-xbox/*.msix') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Xbox-OTFM-MSIX-Release-x64
+          path: dist-xbox/
+          if-no-files-found: warn
